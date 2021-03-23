@@ -65,6 +65,9 @@ constexpr auto kDeprecationWarning =
     "{} API is being deprecated, please ping "
     "https://github.com/pytorch/pytorch/issues/46291 "
     "if you see this warning";
+
+constexpr auto kSecondsToMilliConversion = 1000;
+
 template <typename T>
 using intrusive_ptr_class_ = py::class_<T, c10::intrusive_ptr<T>>;
 
@@ -1075,7 +1078,17 @@ Arguments:
               "barrier",
               &::c10d::ProcessGroup::barrier,
               py::arg("opts") = ::c10d::BarrierOptions(),
-              py::call_guard<py::gil_scoped_release>());
+              py::call_guard<py::gil_scoped_release>())
+          .def(
+              "monitored_barrier",
+              []( const c10::intrusive_ptr<::c10d::ProcessGroup>& self, double timeoutSeconds) {
+                  ::c10d::BarrierOptions opts;
+                  long timeoutMillis = static_cast<long>(timeoutSeconds * kSecondsToMilliConversion);
+                  opts.timeout = std::chrono::milliseconds(timeoutMillis);
+                  return self->monitoredBarrier(opts);
+              },
+              py::call_guard<py::gil_scoped_release>()
+          );
 
   // base ProcessGroup::Options binding
   auto processGroupOptions =
@@ -1871,7 +1884,16 @@ static const auto ProcessGroupTorchBind =
             [](const c10::intrusive_ptr<::c10d::ProcessGroup>& self) {
               ::c10d::BarrierOptions opts;
               return self->barrier(opts);
-            });
+            })
+        .def(
+            "monitored_barrier",
+            [](const c10::intrusive_ptr<::c10d::ProcessGroup>& self, double timeoutSeconds) {
+                ::c10d::BarrierOptions opts;
+                long timeoutMillis = static_cast<long>(timeoutSeconds * kSecondsToMilliConversion);
+                opts.timeout = std::chrono::milliseconds(timeoutMillis);
+                return self->monitoredBarrier(opts);
+            }
+        );
 
 #ifdef USE_C10D_NCCL
 // XXX: Ideally the Options of ProcessGroupNCCL should be

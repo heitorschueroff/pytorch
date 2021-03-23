@@ -1,6 +1,11 @@
 #include <c10d/ProcessGroupGloo.hpp>
 
 #include <c10d/GlooDeviceFactory.hpp>
+#include <chrono>
+#include <exception>
+#include <ratio>
+#include <tuple>
+#include <fmt/format.h>
 
 #ifdef _WIN32
 #include <gloo/common/win.h>
@@ -37,9 +42,9 @@
 #include <c10/cuda/CUDAStream.h>
 #endif
 
-#include <c10/util/irange.h>
 #include <c10/util/StringUtil.h>
 #include <c10/util/intrusive_ptr.h>
+#include <c10/util/irange.h>
 #include <gloo/config.h>
 #include <gloo/rendezvous/context.h>
 #include <gloo/rendezvous/prefix_store.h>
@@ -105,6 +110,22 @@
 namespace c10d {
 
 namespace {
+
+using steady_clock_time_point =
+    std::chrono::time_point<std::chrono::steady_clock>;
+
+std::chrono::milliseconds getRemainingTime(
+    steady_clock_time_point startTime,
+    const std::chrono::milliseconds& timeout) {
+  auto elapsedTime = std::chrono::steady_clock::now() - startTime;
+  auto remainingMillis = timeout -
+      std::chrono::duration_cast<std::chrono::milliseconds>(elapsedTime);
+  const int kMinTimeThresh = 1;
+  std::chrono::milliseconds remaining = remainingMillis.count() < kMinTimeThresh
+      ? std::chrono::milliseconds(kMinTimeThresh)
+      : remainingMillis;
+  return remaining;
+}
 
 // Wrap c10d store as Gloo store
 class GlooStore : public ::gloo::rendezvous::Store {
@@ -342,9 +363,9 @@ void initializeStreamsEvents(
     std::vector<at::cuda::CUDAEvent>& events) {
   // Ensure that the tensors in the nested tensor vectors are on the same
   // device.
-  for (const auto & tensorgroup : tensors) {
+  for (const auto& tensorgroup : tensors) {
     const auto device_id = tensorgroup[0].device().index();
-    for (const auto & tensor: tensorgroup) {
+    for (const auto& tensor : tensorgroup) {
       if (tensor.device().index() != device_id) {
         throw std::runtime_error(
             "tensors in the nested tensor vectors need to "
@@ -1072,7 +1093,7 @@ class AsyncSparseAllreduceWork : public ProcessGroupGloo::AsyncWork {
 
     // Copy back to input tensors.
     outputs.reserve(inputs.size());
-    for (auto & input : inputs) {
+    for (auto& input : inputs) {
       input.copy_(output);
       if (output.is_sparse()) {
         outputs.push_back(output.clone());
@@ -1140,7 +1161,7 @@ class AsyncSparseAllreduceWork : public ProcessGroupGloo::AsyncWork {
     std::vector<at::Tensor> indices;
     indices.reserve(metadata.size());
     size_t offset = 0;
-    for (const auto & i : metadata) {
+    for (const auto& i : metadata) {
       const auto nnz = i.nnz();
       const auto numel = sparseDim * nnz;
       indices.push_back(
@@ -1185,7 +1206,7 @@ class AsyncSparseAllreduceWork : public ProcessGroupGloo::AsyncWork {
     std::vector<at::Tensor> values;
     values.reserve(metadata.size());
     size_t offset = 0;
-    for (const auto & i : metadata) {
+    for (const auto& i : metadata) {
       const auto nnz = i.nnz();
       const auto numel = denseNumel * nnz;
       auto tensorShape = std::vector<int64_t>({(int64_t)nnz});
@@ -1650,7 +1671,7 @@ class AsyncAllgatherWork : public ProcessGroupGloo::AsyncWork {
     gloo::allgather(opts);
 
     // Unflatten into output tensors.
-    for (auto & outputgroup : outputs) {
+    for (auto& outputgroup : outputs) {
       for (const auto j : c10::irange(outputgroup.size())) {
         outputgroup[j].copy_(flatOutputTensor[j]);
       }
@@ -1779,7 +1800,7 @@ c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupGloo::allgather(
   const auto& options = inputs[0].options();
   const auto& sizes = inputs[0].sizes();
   assertTypeAndSizesMatch(invalidArgument, inputs, options, sizes);
-  for (const auto & output : outputs) {
+  for (const auto& output : outputs) {
     assertTypeAndSizesMatch(invalidArgument, output, options, sizes);
   }
 
@@ -2223,7 +2244,7 @@ class AsyncScatterCUDAWork : public AsyncScatterWork {
     }
 
     tmpOutputs.reserve(outputs.size());
-    for (auto & output : outputs) {
+    for (auto& output : outputs) {
       tmpOutputs.push_back(pinnedLike(output));
     }
   }
@@ -2660,6 +2681,64 @@ c10::intrusive_ptr<ProcessGroup::Work> ProcessGroupGloo::barrier(
       std::move(context), std::move(priorWork), tag);
   enqueue(work);
   return work;
+}
+
+void ProcessGroupGloo::monitoredBarrier(const BarrierOptions& opts) {
+  // Use default timeout if no timeout was specified.
+  auto monitoredBarrierTimeout =
+      (opts.timeout == kUnsetTimeout) ? this->options_->timeout : opts.timeout;
+  auto rank = this->getRank();
+  auto t1 = nextTag();
+  auto t2 = nextTag();
+  std::vector<at::Tensor> commTensor = {at::tensor({rank})};
+  auto errStr = "Rank {} failed to pass monitoredBarrier in {} ms";
+  // only enforce timeout on rank 0. This is so that other ranks aren't timed
+  // out first, bringing down the job without reporting which rank timed out.
+  if (rank != 0) {
+    auto sendWork = send(commTensor, 0, t1);
+    sendWork->wait();
+    auto recvWork = recv(commTensor, 0, t2);
+    recvWork->wait();
+    return;
+  }
+  auto startTime = std::chrono::steady_clock::now();
+  auto worldSize = this->getSize();
+  // Holds mapping of rank to pair of recv/send work.
+  std::unordered_map<
+      int,
+      std::tuple<
+          c10::intrusive_ptr<ProcessGroup::Work>,
+          c10::intrusive_ptr<ProcessGroup::Work>>>
+      works;
+  // Kick off all work
+  for (int dstRank = 1; dstRank < worldSize; ++dstRank) {
+    auto recvWork = recv(commTensor, dstRank, t1);
+    auto sendWork = send(commTensor, dstRank, t2);
+    works.insert(
+        {dstRank, std::make_tuple(std::move(recvWork), std::move(sendWork))});
+  }
+
+  // Wait for send/recv from all ranks
+  for (auto& work : works) {
+    // Compute the remaining time for every call to wait() instead of using the
+    // whole timeout every call.
+    auto remainingTime = getRemainingTime(startTime, monitoredBarrierTimeout);
+    try {
+      std::get<0>(work.second)->wait(remainingTime);
+      remainingTime = getRemainingTime(startTime, monitoredBarrierTimeout);
+      std::get<1>(work.second)->wait(remainingTime);
+    } catch (const std::exception& e) {
+      const std::string error =
+          fmt::format(errStr, work.first, monitoredBarrierTimeout.count());
+      LOG(ERROR) << error;
+      throw std::runtime_error(
+          c10::str(error, "\n Original exception: \n") + e.what());
+    }
+  }
+
+  auto remainingTime = getRemainingTime(startTime, monitoredBarrierTimeout);
+  LOG(INFO) << "All ranks passed monitoredBarrier in "
+            << (monitoredBarrierTimeout - remainingTime).count() << " ms.";
 }
 
 } // namespace c10d
